@@ -44,13 +44,22 @@ defmodule Kadabra.Connection do
       streams: streams,
       reconnect: opts[:reconnect] || :true,
       encoder_state: encoder,
-      decoder_state: decoder
+      decoder_state: decoder,
+      transport: transport(opts[:scheme])
     }
   end
 
   def do_connect(uri, opts) do
     case opts[:scheme] do
-      :http -> {:error, :not_implemented}
+      :http ->
+        case :gen_tcp.connect(uri, opts[:port], tcp_options(opts[:tcp])) do
+          {:ok, socket} ->
+            :gen_tcp.send(socket,  Http2.connection_preface)
+            :gen_tcp.send(socket,  Http2.settings_frame)
+            {:ok, socket}
+          {:error, reason} ->
+            {:error,reason}
+        end
       :https ->
         :ssl.start
         case :ssl.connect(uri, opts[:port], ssl_options(opts[:ssl])) do
@@ -64,7 +73,15 @@ defmodule Kadabra.Connection do
       _ -> {:error, :bad_scheme}
     end
   end
-
+  defp tcp_options(nil), do: tcp_options([])
+  defp tcp_options(opts) do
+    opts ++ [
+      {:active, :once},
+      {:packet, :raw},
+      {:reuseaddr, false},
+      :binary
+    ]
+  end
   defp ssl_options(nil), do: ssl_options([])
   defp ssl_options(opts) do
     opts ++ [
@@ -115,9 +132,9 @@ defmodule Kadabra.Connection do
     {:noreply, state}
   end
 
-  def handle_cast({:send, :ping}, %{socket: socket} = state) do
+  def handle_cast({:send, :ping}, %{transport: transport, socket: socket} = state) do
     ping = Http2.build_frame(0x6, 0x0, 0x0, <<0, 0, 0, 0, 0, 0, 0, 0>>)
-    :ssl.send(socket, ping)
+    transport.send(socket, ping)
     {:noreply, state}
   end
 
@@ -161,23 +178,22 @@ defmodule Kadabra.Connection do
 
     stream = get_stream(stream_id, state)
     {:ok, {headers, new_dec}} = :hpack.decode(payload, dec)
-    status =
-      headers
-      |> get_status()
-      |> String.to_integer
-    stream = %Stream{stream | headers: headers, status: status}
-
     state = %{state | decoder_state: new_dec}
-
-    if flags == 0x5 do 
+    if flags == 0x5 do
       send pid, {:end_stream, stream}
       remove_stream(state, stream_id)
     else
+      status =
+        headers
+        |> get_status()
+        |> String.to_integer
+      stream = %Stream{stream | headers: headers, status: status}
       put_stream(stream_id, state, stream)
     end
   end
 
-  defp do_send_headers(headers, payload, %{socket: socket,
+  defp do_send_headers(headers, payload, %{ transport: transport,
+    socket: socket,
                                            stream_id: stream_id,
                                            uri: uri,
                                            encoder_state: encoder} = state) do
@@ -187,11 +203,11 @@ defmodule Kadabra.Connection do
     headers_payload = :erlang.iolist_to_binary(encoded)
     h = Http2.build_frame(@headers, 0x4, stream_id, headers_payload)
 
-    :ssl.send(socket, h)
+    transport.send(socket, h)
 
     if payload do
       h_p = Http2.build_frame(@data, 0x1, stream_id, payload)
-      :ssl.send(socket, h_p)
+      transport.send(socket, h_p)
     end
     %{state | encoder_state: new_encoder}
   end
@@ -206,9 +222,9 @@ defmodule Kadabra.Connection do
     Enum.sort(h, fn({a, _b}, {c, _d}) -> a < c end)
   end
 
-  defp do_send_goaway(%{socket: socket, stream_id: stream_id}) do
+  defp do_send_goaway(%{transport: transport, socket: socket, stream_id: stream_id}) do
     h = Http2.goaway_frame(stream_id, Error.code("NO_ERROR"))
-    :ssl.send(socket, h)
+    transport.send(socket, h)
   end
 
   defp do_recv_goaway(frame, %{client: pid} = state) do
@@ -224,7 +240,9 @@ defmodule Kadabra.Connection do
     Logger.error "Got GOAWAY, #{error}, Last Stream: #{id}, Rest: #{bin}"
   end
 
-  defp do_recv_settings(frame, %{socket: socket,
+  defp do_recv_settings(frame, %{
+      transport: transport,
+      socket: socket,
                                  client: pid,
                                  decoder_state: decoder}  = state) do
     case frame[:flags] do
@@ -237,7 +255,7 @@ defmodule Kadabra.Connection do
         table_size = fetch_setting(settings, "SETTINGS_MAX_HEADER_LIST_SIZE")
         new_decoder = :hpack.new_max_table_size(table_size, decoder)
 
-        :ssl.send(socket, settings_ack)
+        transport.send(socket, settings_ack)
         send pid, {:ok, self()}
         %{state | decoder_state: new_decoder}
     end
@@ -272,7 +290,8 @@ defmodule Kadabra.Connection do
     %{state | streams: Map.delete(streams, id_string) }
   end
 
-  def handle_info({:tcp, _socket, _bin}, state) do
+  def handle_info({:tcp, _socket, bin}, state) do
+    do_recv_tcp(bin, state)
     {:noreply, state}
   end
 
@@ -296,6 +315,17 @@ defmodule Kadabra.Connection do
         {:noreply, %{state | buffer: ""}}
       {:error, bin} ->
         :ssl.setopts(socket, [{:active, :once}])
+        {:noreply, %{state | buffer: bin}}
+    end
+  end
+  defp do_recv_tcp(bin, %{socket: socket} = state) do
+    bin = state[:buffer] <> bin
+    case parse_ssl(socket, bin, state) do
+      :ok ->
+        :inet.setopts(socket, [{:active, :once}])
+        {:noreply, %{state | buffer: ""}}
+      {:error, bin} ->
+        :inet.setopts(socket, [{:active, :once}])
         {:noreply, %{state | buffer: bin}}
     end
   end
@@ -363,13 +393,18 @@ defmodule Kadabra.Connection do
     case do_connect(uri, opts) do
       {:ok, socket} ->
         Logger.debug "Socket closed, reopened automatically"
-        state |> inspect |> Logger.info 
+        state |> inspect |> Logger.info
         encoder = :hpack.new_context
         decoder = :hpack.new_context
-        {:noreply, %{state | encoder_state: encoder, decoder_state: decoder, socket: socket, streams: %{}}}
+        {:noreply, %{state |
+          encoder_state: encoder,
+          decoder_state: decoder,
+          socket: socket,
+          streams: %{}
+        }}
       {:error, error} ->
         Logger.error "Socket closed, reopening failed with #{error}"
-        state |> inspect |> Logger.info 
+        state |> inspect |> Logger.info
         send(pid, :closed)
          {:stop, :normal, state}
     end
@@ -377,8 +412,10 @@ defmodule Kadabra.Connection do
 
   defp get_status(headers) do
     case Enum.find(headers, fn({key, _val}) -> key == ":status" end) do
-      {":status", status} -> status
+      {_key, status} -> status
       nil -> nil
     end
   end
+  defp transport(:http), do: :gen_tcp
+  defp transport(:https), do: :ssl
 end
