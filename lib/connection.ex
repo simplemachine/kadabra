@@ -25,7 +25,6 @@ defmodule Kadabra.Connection do
         state = initial_state(socket, uri, pid, opts)
         {:ok, state}
       {:error, error} ->
-        Logger.error(inspect(error))
         {:stop, error}
     end
   end
