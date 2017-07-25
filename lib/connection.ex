@@ -26,7 +26,7 @@ defmodule Kadabra.Connection do
         {:ok, state}
       {:error, error} ->
         Logger.error(inspect(error))
-        {:error, error}
+        {:stop, error}
     end
   end
 
