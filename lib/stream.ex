@@ -3,7 +3,7 @@ defmodule Kadabra.Stream do
   Struct returned from open connections.
   """
   defstruct [:id, :uri, :connection, :encoder, :decoder,
-             :socket, headers: [], body: "", scheme: :https]
+             :socket, headers: [], body: "", scheme: :https, transport: :ssl]
 
   alias Kadabra.{Connection, Encodable, Hpack, Http2, Stream}
   alias Kadabra.Frame.{Continuation, Data, Headers, PushPromise, RstStream}
@@ -26,7 +26,8 @@ defmodule Kadabra.Stream do
       connection: self(),
       socket: conn.socket,
       encoder: conn.encoder_state,
-      decoder: conn.decoder_state
+      decoder: conn.decoder_state,
+      transport: conn.transport
     }
   end
 
@@ -44,7 +45,7 @@ defmodule Kadabra.Stream do
 
   def handle_event(:enter, _old, @half_closed_remote, stream) do
     bin = stream.id |> RstStream.new |> Encodable.to_bin
-    :ssl.send(stream.socket, bin)
+    stream.transport.send(stream.socket, bin)
 
     :gen_statem.cast(self(), :close)
     {:keep_state, stream}
@@ -112,11 +113,11 @@ defmodule Kadabra.Stream do
 
     #stream = %{stream | encoder: new_encoder}
 
-    :ssl.send(stream.socket, h)
+    stream.transport.send(stream.socket, h)
 
     if payload do
       h_p = Http2.build_frame(@data, 0x1, stream.id, payload)
-      :ssl.send(stream.socket, h_p)
+      stream.transport.send(stream.socket, h_p)
     end
 
     {:next_state, @open, stream}

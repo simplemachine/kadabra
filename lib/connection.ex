@@ -12,7 +12,8 @@ defmodule Kadabra.Connection do
             stream_id: 1,
             reconnect: true,
             encoder_state: nil,
-            decoder_state: nil
+            decoder_state: nil,
+            transport: nil
 
   use GenServer
   require Logger
@@ -41,8 +42,7 @@ defmodule Kadabra.Connection do
         state = initial_state(socket, uri, pid, opts)
         {:ok, state}
       {:error, error} ->
-        Logger.error(inspect(error))
-        {:error, error}
+        {:stop, error}
     end
   end
 
@@ -57,31 +57,44 @@ defmodule Kadabra.Connection do
       socket: socket,
       reconnect: opts[:reconnect],
       encoder_state: encoder,
-      decoder_state: decoder
+      decoder_state: decoder,
+      transport: transport(opts[:scheme])
     }
   end
 
   def do_connect(uri, opts) do
     case opts[:scheme] do
-      :http -> {:error, :not_implemented}
-      :https -> do_connect_ssl(uri, opts)
+      :http ->
+        case :gen_tcp.connect(uri, opts[:port], tcp_options(opts[:tcp])) do
+          {:ok, socket} ->
+            :gen_tcp.send(socket,  Http2.connection_preface)
+            :gen_tcp.send(socket,  Http2.settings_frame)
+            {:ok, socket}
+          {:error, reason} ->
+            {:error,reason}
+        end
+      :https ->
+        :ssl.start()
+        case :ssl.connect(uri, opts[:port], ssl_options(opts[:ssl])) do
+          {:ok, ssl} ->
+            :ssl.send(ssl, Http2.connection_preface)
+            :ssl.send(ssl, Http2.settings_frame)
+            {:ok, ssl}
+          {:error, reason} ->
+            {:error, reason}
+        end
       _ -> {:error, :bad_scheme}
     end
   end
-
-  def do_connect_ssl(uri, opts) do
-    :ssl.start()
-    ssl_opts = ssl_options(opts[:ssl])
-    case :ssl.connect(uri, opts[:port], ssl_opts) do
-      {:ok, ssl} ->
-        :ssl.send(ssl, Http2.connection_preface)
-        :ssl.send(ssl, Http2.settings_frame)
-        {:ok, ssl}
-      {:error, reason} ->
-        {:error, reason}
-    end
+  defp tcp_options(nil), do: tcp_options([])
+  defp tcp_options(opts) do
+    opts ++ [
+      {:active, :once},
+      {:packet, :raw},
+      {:reuseaddr, false},
+      :binary
+    ]
   end
-
   defp ssl_options(nil), do: ssl_options([])
   defp ssl_options(opts) do
     opts ++ [
@@ -160,9 +173,9 @@ defmodule Kadabra.Connection do
     {:noreply, state}
   end
 
-  def handle_cast({:send, :ping}, %{socket: socket} = state) do
+  def handle_cast({:send, :ping}, %{socket: socket, transport: transport} = state) do
     bin = Ping.new |> Encodable.to_bin
-    :ssl.send(socket, bin)
+    transport.send(socket, bin)
     {:noreply, state}
   end
 
@@ -189,9 +202,9 @@ defmodule Kadabra.Connection do
     state
   end
 
-  defp do_send_goaway(%{socket: socket, stream_id: stream_id}) do
+  defp do_send_goaway(%{socket: socket, stream_id: stream_id, transport: transport}) do
     bin = stream_id |> Goaway.new |> Encodable.to_bin
-    :ssl.send(socket, bin)
+    transport.send(socket, bin)
   end
 
   defp do_recv_goaway(%Goaway{last_stream_id: id,
@@ -210,7 +223,8 @@ defmodule Kadabra.Connection do
   defp do_recv_settings(%Frame.Settings{settings: settings} = frame,
                         %{socket: socket,
                           client: pid,
-                          decoder_state: decoder}  = state) do
+                          decoder_state: decoder,
+                          transport: transport}  = state) do
 
     if frame.ack do
       send(pid, {:ok, self()})
@@ -220,7 +234,7 @@ defmodule Kadabra.Connection do
       Hpack.update_max_table_size(decoder, settings.max_header_list_size)
 
       settings_ack = Http2.build_frame(@settings, 0x1, 0x0, <<>>)
-      :ssl.send(socket, settings_ack)
+      transport.send(socket, settings_ack)
 
       send(pid, {:ok, self()})
 
@@ -239,14 +253,14 @@ defmodule Kadabra.Connection do
     {:noreply, state}
   end
 
-  def handle_info({:tcp, _socket, _bin}, state) do
-    {:noreply, state}
-  end
 
   def handle_info({:tcp_closed, _socket}, state) do
     maybe_reconnect(state)
   end
 
+  def handle_info({:tcp, _socket, bin}, state) do
+    do_recv_tcp(bin, state)
+  end
   def handle_info({:ssl, _socket, bin}, state) do
     do_recv_ssl(bin, state)
   end
@@ -260,6 +274,14 @@ defmodule Kadabra.Connection do
     case parse_ssl(socket, bin, state) do
       {:error, bin} ->
         :ssl.setopts(socket, [{:active, :once}])
+        {:noreply, %{state | buffer: bin}}
+    end
+  end
+  defp do_recv_tcp(bin, %{socket: socket} = state) do
+    bin = state.buffer <> bin
+    case parse_ssl(socket, bin, state) do
+      {:error, bin} ->
+        :inet.setopts(socket, [{:active, :once}])
         {:noreply, %{state | buffer: bin}}
     end
   end
@@ -356,4 +378,7 @@ defmodule Kadabra.Connection do
     {:ok, dec} = Hpack.start_link
     %{state | encoder_state: enc, decoder_state: dec, socket: socket}
   end
+
+  defp transport(:http), do: :gen_tcp
+  defp transport(:https), do: :ssl
 end
