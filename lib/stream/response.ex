@@ -11,8 +11,8 @@ defmodule Kadabra.Stream.Response do
     status: integer
   }
 
-  @spec new(%Kadabra.Stream{}) :: t
-  def new(%Kadabra.Stream{id: id, headers: headers, body: body}) do
+  # @spec new(%Kadabra.Stream{}) :: t
+  def new(%{id: id, headers: headers, body: body}) do
     %__MODULE__{
       id: id,
       headers: headers,

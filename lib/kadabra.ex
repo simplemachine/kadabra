@@ -63,11 +63,11 @@ defmodule Kadabra do
   end
 
   def request(pid, headers) do
-    GenServer.cast(pid, {:send, :headers, headers})
+    GenServer.cast(pid, {:send, :headers, self(), headers})
   end
 
   def request(pid, headers, payload) do
-    GenServer.cast(pid, {:send, :headers, headers, payload})
+    GenServer.cast(pid, {:send, :headers, self(), headers, payload})
   end
 
   def get(pid, path) do

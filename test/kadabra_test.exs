@@ -33,8 +33,8 @@ defmodule KadabraTest do
   describe "GET"  do
     test "https://http2.golang.org/reqinfo" do
       uri = 'http2.golang.org'
-      {:ok, pid} = Kadabra.open(uri, :https)
-      Kadabra.get(pid, "/reqinfo")
+      {:ok, pid1} = Kadabra.open(uri, :https)
+      Kadabra.get(pid1, "/reqinfo")
 
       assert_receive {:end_stream, %Stream.Response{
         id: 1,
@@ -82,6 +82,7 @@ defmodule KadabraTest do
 
       receive do
         {:push_promise, response} ->
+          IO.inspect(response)
           assert response.id == 2
           refute response.status
           assert Stream.Response.get_header(response.headers, ":path")
