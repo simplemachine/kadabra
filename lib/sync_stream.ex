@@ -62,11 +62,13 @@ defmodule Kadabra.SyncStream do
     {:ok, {encoded, new_encoder_state}} = :hpack.encode(headers, connection.encoder_state)
     headers_payload = :erlang.iolist_to_binary(encoded)
     h = Http2.build_frame(@headers, 0x4, stream.id, headers_payload)
-    connection.transport.send(connection.socket, h)
+    send_payload = h <>
     if payload do
-      h_p = Http2.build_frame(@data, 0x1, stream.id, payload)
-      connection.transport.send(connection.socket, h_p)
+      Http2.build_frame(@data, 0x1, stream.id, payload)
+    else
+      ""
     end
+    connection.transport.send(connection.socket, send_payload)
     on_enter(%{stream | state: @open},%{connection | encoder_state: new_encoder_state}, nil)
   end
 
