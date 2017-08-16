@@ -216,11 +216,18 @@ defmodule Kadabra.Connection do
   def handle_info({:tcp_closed, _socket}, state) do
     maybe_reconnect(state)
   end
+  def handle_info({:tcp_error, socket, reason}, state) do
+    :inet.setopts(socket, [active: :once])
+    Logger.error "error in socket #{inspect(reason)}"
+    {:noreply, state}
+  end
 
-  def handle_info({:tcp, _socket, bin}, state) do
+  def handle_info({:tcp, socket, bin}, state) do
+    :inet.setopts(socket, [active: :once])
     do_recv_tcp(bin, state)
   end
-  def handle_info({:ssl, _socket, bin}, state) do
+  def handle_info({:ssl, socket, bin}, state) do
+    :ssl.setopts(socket, [{:active, :once}])
     do_recv_ssl(bin, state)
   end
 
@@ -232,7 +239,6 @@ defmodule Kadabra.Connection do
     bin = state.buffer <> bin
     case parse_ssl(socket, bin, state) do
       {:error, bin, state} ->
-        :ssl.setopts(socket, [{:active, :once}])
         {:noreply, %{state | buffer: bin}}
     end
   end
@@ -240,7 +246,6 @@ defmodule Kadabra.Connection do
     bin = state.buffer <> bin
     case parse_ssl(socket, bin, state) do
       {:error, bin, state} ->
-        :inet.setopts(socket, [{:active, :once}])
         {:noreply, %{state | buffer: bin}}
     end
   end
@@ -248,6 +253,7 @@ defmodule Kadabra.Connection do
   def parse_ssl(socket, bin, state) do
     case Kadabra.Frame.new(bin) do
       {:ok, frame, rest} ->
+        state = %{state | last_frame: frame}
         state = handle_response(frame, state)
         parse_ssl(socket, rest, state)
       {:error, bin} ->
