@@ -1,8 +1,19 @@
 defmodule Kadabra.Frame.Settings do
+  @moduledoc false
+
   defstruct [:settings, ack: false]
 
   alias Kadabra.Connection
   alias Kadabra.Frame.Flags
+
+  @type t :: %__MODULE__{
+    ack: boolean,
+    settings: Connection.Settings.t
+  }
+
+  def ack do
+    %__MODULE__{ack: true, settings: nil}
+  end
 
   def new(%{payload: p, flags: flags}) do
     s_list = parse_settings(p)
@@ -27,6 +38,23 @@ defmodule Kadabra.Frame.Settings do
     case Connection.Settings.put(settings, ident, value) do
       {:ok, settings} -> put_settings(settings, rest)
       {:error, code, settings} -> {:error, code, settings}
+    end
+  end
+end
+
+defimpl Kadabra.Encodable, for: Kadabra.Frame.Settings do
+  alias Kadabra.Http2
+
+  @settings 0x4
+
+  def to_bin(frame) do
+    ack = if frame.ack, do: 0x1, else: 0x0
+    case frame.settings do
+      nil ->
+        Http2.build_frame(@settings, ack, 0x0, <<>>)
+      _else ->
+        # TODO: Make this actually encode something
+        Http2.build_frame(@settings, ack, 0x0, <<>>)
     end
   end
 end

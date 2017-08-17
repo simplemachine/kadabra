@@ -15,7 +15,9 @@ defmodule Kadabra.Connection do
             decoder_state: nil,
             pp_frame: nil,
             transport: nil,
-            streams: %{}
+            streams: %{},
+            queue: [],
+            flow_control: nil
 
   use GenServer
   require Logger
@@ -71,7 +73,8 @@ defmodule Kadabra.Connection do
         case :gen_tcp.connect(uri, opts[:port], tcp_options(opts[:tcp])) do
           {:ok, socket} ->
             :gen_tcp.send(socket,  Http2.connection_preface)
-            :gen_tcp.send(socket,  Http2.settings_frame)
+            bin = %Frame.Settings{} |> Encodable.to_bin
+            :gen_tcp.send(socket,  bin)
             {:ok, socket}
           {:error, reason} ->
             {:error,reason}
@@ -81,7 +84,8 @@ defmodule Kadabra.Connection do
         case :ssl.connect(uri, opts[:port], ssl_options(opts[:ssl])) do
           {:ok, ssl} ->
             :ssl.send(ssl, Http2.connection_preface)
-            :ssl.send(ssl, Http2.settings_frame)
+            bin = %Frame.Settings{} |> Encodable.to_bin
+            :ssl.send(ssl,  bin)
             {:ok, ssl}
           {:error, reason} ->
             {:error, reason}
@@ -253,7 +257,6 @@ defmodule Kadabra.Connection do
   def parse_ssl(socket, bin, state) do
     case Kadabra.Frame.new(bin) do
       {:ok, frame, rest} ->
-        state = %{state | last_frame: frame}
         state = handle_response(frame, state)
         parse_ssl(socket, rest, state)
       {:error, bin} ->
@@ -293,7 +296,9 @@ defmodule Kadabra.Connection do
     state
   end
   defp handle_frame(frame = %{type: @data},  stream, state) do
-    Stream.receive(Data.new(frame), stream, state)
+    data = Data.new(frame)
+    send_window_update(state, data)
+    Stream.receive(data, stream, state)
     |> handle_stream_response
   end
   defp handle_frame(frame = %{type: @headers},  stream, state) do
@@ -321,13 +326,21 @@ defmodule Kadabra.Connection do
     update_stream(state, stream)
   end
 
-  def handle_settings(frame) do
+  defp handle_settings(frame) do
     case Frame.Settings.new(frame) do
       {:ok, s} ->
         GenServer.cast(self(), {:recv, s})
       _else ->
         # TODO: handle bad settings
         :error
+    end
+  end
+  defp send_window_update(_state, %Data{data: nil}), do: :ok
+  defp send_window_update(state, %Data{data: data}) do
+    if byte_size(data) > 0 do
+      # IO.puts("<-- Window Update, #{byte_size(data)} bytes")
+      bin = data |> WindowUpdate.new |> Encodable.to_bin
+      state.transport.send(state.socket, bin)
     end
   end
 

@@ -52,4 +52,12 @@ defmodule Kadabra.Connection.Settings do
   end
 
   def put(settings, _else, _value), do: {:ok, settings}
+  def merge(old_settings, new_settings) do
+    Map.merge(old_settings, new_settings, fn
+      (:__struct__, v1, _) -> v1
+      (_, nil, v2) -> v2
+      (_, v1, nil) -> v1
+      (_, _, v2) -> v2
+    end)
+  end
 end
